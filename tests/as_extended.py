@@ -55,29 +55,45 @@ before "file" {
 
 SITECUSTOMIZE = '''
 # Written by of-asks's tests/as_extended.py for one run of the tests of "file": every `of ask` asks the throwaway
-# organization's hooks. Never installed anywhere else.
-import os, sys
-_of_bin = os.path.join(os.environ["AS_EXTENDED_OF_HOME"], "bin")
-if _of_bin not in sys.path:
-    sys.path.insert(0, _of_bin)
-# OF's tests give each test a home folder of its own, where OF's configuration names no Bench: the Bench this run
-# installed with, found where the real configuration names it, is handed to of_method here
-sys.path.insert(0, os.path.join(os.environ["AS_EXTENDED_BENCH"], "bin"))
-import bench, of_asks_package, of_method
-of_method.bench, of_method.BenchError, of_method._MISSING = bench, bench.BenchError, None
-_org = os.environ["AS_EXTENDED_ORG"]
-_log = os.environ["AS_EXTENDED_LOG"]
+# organization's hooks. Never installed anywhere else. It imports nothing of OF's at a process's start, so OF's test
+# isolation (its own home and state folders) is in place before any OF module reads them: it only waits for OF to
+# import of_asks_package, and patches that module then.
+import importlib.abc, importlib.machinery, os, sys
 
 
 def _before_file(project, card, org=None, ask=None):
+    sys.path.insert(0, os.path.join(os.environ["AS_EXTENDED_BENCH"], "bin"))
+    import bench, of_asks_package, of_method
+    # OF's tests give each test a home folder of its own, where OF's configuration names no Bench: the Bench this run
+    # installed with, found where the real configuration names it, is handed to of_method here
+    of_method.bench, of_method.BenchError, of_method._MISSING = bench, bench.BenchError, None
     card = {k: card[k] for k in of_asks_package.CARD_KEYS if k in card}
-    d = of_method.before(_org, "of-asks", "file", card)
-    with open(_log, "a") as f:
+    d = of_method.before(os.environ["AS_EXTENDED_ORG"], "of-asks", "file", card)
+    with open(os.environ["AS_EXTENDED_LOG"], "a") as f:
         f.write(d["decision"] + "\\n")
     return d
 
 
-of_asks_package.before_file = _before_file
+class _Patch(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, name, path=None, target=None):
+        if name != "of_asks_package":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None:
+            return None
+        self._real = spec.loader
+        spec.loader = self
+        return spec
+
+    def create_module(self, spec):
+        return self._real.create_module(spec)
+
+    def exec_module(self, module):
+        self._real.exec_module(module)
+        module.before_file = _before_file
+
+
+sys.meta_path.insert(0, _Patch())
 '''
 
 UNITTEST = re.compile(r"^(test\w*) \(([\w.]+)\)(?:\n.*?)? \.\.\. (ok|FAIL|ERROR|skipped.*|expected failure|"
@@ -101,30 +117,30 @@ def install(org, hook):
 
 
 def run(name, hook):
+    """The tests of "file" with HOOK installed (None: the package not installed, the baseline): (held, broke, the
+    hook's decisions)."""
     t = tempfile.mkdtemp(prefix="of-asks-as-extended.")
     try:
-        org, site, log = os.path.join(t, "org"), os.path.join(t, "site"), os.path.join(t, "decisions")
-        os.makedirs(org)
-        os.makedirs(site)
-        bench_home = install(org, hook)
-        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
-            f.write(SITECUSTOMIZE)
-        env = dict(os.environ, PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""),
-                   AS_EXTENDED_OF_HOME=OF_HOME, AS_EXTENDED_BENCH=bench_home, AS_EXTENDED_ORG=org,
-                   AS_EXTENDED_LOG=log)
+        env = dict(os.environ)
+        log = os.path.join(t, "decisions")
+        if hook is not None:
+            org, site = os.path.join(t, "org"), os.path.join(t, "site")
+            os.makedirs(org)
+            os.makedirs(site)
+            bench_home = install(org, hook)
+            with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+                f.write(SITECUSTOMIZE)
+            env.update(PYTHONPATH=site + os.pathsep + os.environ.get("PYTHONPATH", ""), AS_EXTENDED_BENCH=bench_home,
+                       AS_EXTENDED_ORG=org, AS_EXTENDED_LOG=log)
         r = subprocess.run([sys.executable, "-m", "unittest", "-v", *FILE_TESTS], cwd=OF_HOME, env=env,
                            capture_output=True, text=True, timeout=1800)
         out = r.stdout + r.stderr
-        def name(m):
+
+        def name_of(m):
             return m.group(2) if m.group(2).endswith(m.group(1)) else f"{m.group(2)}.{m.group(1)}"
-        held = [name(m) for m in UNITTEST.finditer(out) if m.group(3) == "ok"]
-        broke = [name(m) for m in UNITTEST.finditer(out) if m.group(3) in ("FAIL", "ERROR")]
+        held = {name_of(m) for m in UNITTEST.finditer(out) if m.group(3) == "ok"}
+        broke = {name_of(m) for m in UNITTEST.finditer(out) if m.group(3) in ("FAIL", "ERROR")}
         decisions = open(log).read().split() if os.path.exists(log) else []
-        print(f"with a hook that {name}: {len(held)} hold, {len(broke)} do not; the hook decided "
-              f"{len(decisions)} cards ({decisions.count('pass')} pass, {len(decisions) - decisions.count('pass')} "
-              f"not)")
-        for b in broke:
-            print(f"  no longer holds: {b}")
         return held, broke, decisions
     finally:
         shutil.rmtree(t, ignore_errors=True)
@@ -133,13 +149,26 @@ def run(name, hook):
 def main():
     if not OF_HOME or not os.path.isfile(os.path.join(OF_HOME, "bin", "of_asks_package.py")):
         raise SystemExit("set OF_HOME to an organic-framework checkout with bin/of_asks_package.py")
-    held1, broke1, dec1 = run("passes every card", HOOKS["passes every card"])
-    held2, broke2, dec2 = run("stops a card tagged money", HOOKS["stops a card tagged money"])
-    ok = bool(dec1) and not broke1 and bool(dec2)
-    if not dec1:
-        print("the hook decided no card: the tests did not reach it, so this run shows nothing")
-    if broke1:
-        print("a hook that passes every card broke tests: the module as extended does not keep its promises")
+    # the baseline first: a test that fails here fails for a reason of its own, not the hook's, and is not counted
+    held0, broke0, _ = run("the baseline", None)
+    print(f"without the package: {len(held0)} hold, {len(broke0)} do not")
+    for b in sorted(broke0):
+        print(f"  does not hold without it either (not counted): {b}")
+    ok = True
+    for name, hook in HOOKS.items():
+        held, broke, decisions = run(name, hook)
+        lost = sorted(broke - broke0)
+        print(f"with a hook that {name}: {len(held)} hold, {len(lost)} no longer hold; the hook decided "
+              f"{len(decisions)} cards ({decisions.count('pass')} pass, {len(decisions) - decisions.count('pass')} "
+              f"not)")
+        for b in lost:
+            print(f"  no longer holds: {b}")
+        if not decisions:
+            print("  the hook decided no card: the tests did not reach it, so this run shows nothing")
+            ok = False
+        if name == "passes every card" and lost:
+            print("  a hook that passes every card broke tests: the module as extended does not keep its promises")
+            ok = False
     return 0 if ok else 1
 
 
