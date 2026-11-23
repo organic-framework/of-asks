@@ -164,8 +164,8 @@ def install(org, hook):
 
 
 def run(name, hook):
-    """The tests of "file" with HOOK installed (None: the package not installed, the baseline): (held, broke, the
-    hook's decisions, the run's exit status)."""
+    """The tests of "file" with HOOK installed (None: the package not installed, the baseline): (each test's result
+    by its id, the hook's decisions, the run's exit status)."""
     t = tempfile.mkdtemp(prefix="of-asks-as-extended.")
     try:
         env = dict(os.environ)
@@ -190,12 +190,11 @@ def run(name, hook):
             code, out = "cut off at 1800 s", f"{e.stdout or ''}{e.stderr or ''}"
             print(f"{name}: the run was cut off at 1800 s")
         lines = [ln.split(" ", 1) for ln in open(results).read().splitlines()] if os.path.exists(results) else []
-        held = {i for s_, i in lines if s_ == "ok"}
-        broke = {i for s_, i in lines if s_ in ("FAIL", "ERROR")}
+        status = {i: s_ for s_, i in lines}
         decisions = open(log).read().split() if os.path.exists(log) else []
         if code != 0 and not lines:
             print(f"{name}: unittest exited {code} with no result line:\n{out[-2000:]}")
-        return held, broke, decisions, code
+        return status, decisions, code
     finally:
         shutil.rmtree(t, ignore_errors=True)
 
@@ -205,7 +204,9 @@ def main():
         raise SystemExit("set OF_HOME to an organic-framework checkout with bin/of_asks_package.py")
     # the baseline first: a test that does not hold here fails for a reason of its own, not the hook's, and is not
     # counted
-    held0, broke0, _, code0 = run("the baseline", None)
+    status0, _, _ = run("the baseline", None)
+    held0 = {i for i, s_ in status0.items() if s_ == "ok"}
+    broke0 = set(status0) - held0
     print(f"without the package: {len(held0)} hold, {len(broke0)} do not")
     for b in sorted(broke0):
         print(f"  does not hold without it either (not counted): {b}")
@@ -213,19 +214,24 @@ def main():
     if not ok:
         print("  the baseline gave no result line: this run shows nothing")
     for name, hook in HOOKS.items():
-        held, broke, decisions, code = run(name, hook)
-        # a test held without the hook and not with it no longer holds, whatever its line says: a FAIL, an ERROR, a
-        # skip, a line another process's output broke, or no line at all (a module that did not import, a timeout)
+        status, decisions, code = run(name, hook)
+        held = {i for i, s_ in status.items() if s_ == "ok"}
+        # a test held without the hook and not with it no longer holds, whatever became of it: it failed, it was
+        # skipped, or it gave no result at all (its module did not import, the run was cut off)
         lost = sorted(held0 - held)
-        unseen = sorted((held0 | broke0) - (held | broke))
+        failed = [b for b in lost if status.get(b) in ("FAIL", "ERROR")]
+        other = [b for b in lost if b in status and b not in failed]
+        unrun = [b for b in lost if b not in status]
         stops = len(decisions) - decisions.count("pass")
         print(f"with a hook that {name}: {len(held)} hold, {len(lost)} no longer hold; the hook decided "
               f"{len(decisions)} cards ({decisions.count('pass')} pass, {stops} not)")
-        for b in lost:
-            print(f"  no longer holds: {b}")
-        if unseen:
-            print(f"  {len(unseen)} of the baseline's tests gave no result line under this hook (counted above)")
-        if not (held or broke):
+        for b in failed:
+            print(f"  no longer holds, it fails: {b}")
+        for b in other:
+            print(f"  no longer holds, {status[b]}: {b}")
+        for b in unrun:
+            print(f"  no longer holds, it did not run: {b}")
+        if not status:
             print("  no result line at all under this hook: this run shows nothing")
             ok = False
         if not decisions:
