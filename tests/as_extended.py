@@ -129,6 +129,12 @@ class Result(unittest.TextTestResult):
         super().addError(test, err)
         self._put(test, "ERROR")
 
+    def addSubTest(self, test, subtest, err):
+        # a failing subtest fails its test, which then gets no addSuccess: its line says so (of_asks on PR 1)
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            self._put(test, "FAIL" if issubclass(err[0], test.failureException) else "ERROR")
+
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
         self._put(test, "skipped")
